@@ -30,6 +30,8 @@ import json
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from typing import Literal
 
 import pandas as pd
@@ -37,17 +39,56 @@ from pydantic import BaseModel, Field
 
 from agentkit import LLM, Agent, tool
 from agentkit.model import LLMAPI
+import agentkit.model as _agentkit_model
+
+# =============================================================================
+# SEÇÃO 1b: TIMEOUT HTTP MAIOR PARA O MODELO LOCAL (CORREÇÃO NOVA)
+# =============================================================================
+# O agentkit trava o timeout da chamada HTTP em 60s fixos, dentro da função
+# post() de agentkit/model.py — sem parâmetro exposto no construtor do
+# LLMAPI (daí o TypeError ao tentar passar timeout=...). Em CPU ARM, o
+# modelo de 3B reprocessa a conversa inteira a cada chamada, e ela cresce a
+# cada ferramenta usada dentro do mesmo caso; com 2+ ferramentas, 60s pode
+# não ser suficiente (foi exatamente o "ERRO: timed out" do caso 5 e da
+# Fase 2 no log).
+#
+# Correção: substituímos a função post() do módulo agentkit.model por uma
+# cópia idêntica, só que com um timeout bem maior — sem tocar em nenhum
+# arquivo da biblioteca instalada. Isso é feito ANTES de qualquer chamada,
+# porque post() é resolvida pelo nome dentro do módulo agentkit.model em
+# tempo de execução (late binding), então bastam patchear o atributo do
+# módulo antes do primeiro llm.invoke().
+
+TIMEOUT_LOCAL_SEGUNDOS = 300  # 5 minutos de folga para o modelo local em ARM
+
+
+def _post_com_timeout_maior(url: str, payload: dict, api_key: str) -> dict:
+    """Cópia de agentkit.model.post, idêntica exceto pelo timeout maior."""
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "agentkit",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_LOCAL_SEGUNDOS) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"{error.code} {error.reason}: {error.read().decode('utf-8')}") from error
+
+
+_agentkit_model.post = _post_com_timeout_maior
+print(f"Timeout HTTP do agentkit ajustado para {TIMEOUT_LOCAL_SEGUNDOS}s (padrão da lib: 60s).")
 
 # =============================================================================
 # SEÇÃO 2: MODELO (Ollama Local - Qwen 2.5 3B)
 # =============================================================================
 
 # Configurar LLMAPI para usar Ollama local (compatível com OpenAI)
-# NOTA: esta versão do agentkit não expõe "timeout" no construtor do LLMAPI —
-# o timeout da chamada HTTP é fixo em 60s dentro de post() (agentkit/model.py).
-# Isso pode ser curto para uma geração longa em ARM; se aparecer erro de
-# timeout, a correção é editar o "timeout=60" dentro de agentkit/model.py
-# (função post) diretamente, e não passar o argumento aqui.
 llm = LLMAPI(
     model="qwen2.5:3b",
     base_url="http://localhost:11434/v1",
@@ -240,6 +281,13 @@ def verificar_portas_abertas(portas_json: str) -> str:
     portas_perigosas = []
     portas_ok = []
 
+    # CORREÇÃO: portas 4444 e 31337 decidem o veredicto sozinhas segundo os
+    # critérios do prompt de sistema, mas um modelo local pequeno às vezes
+    # não aplica bem essa regra e responde ALERTA em vez de COMPROMETIDO.
+    # Sinalizar isso diretamente na saída da ferramenta tira parte do
+    # raciocínio do modelo e deixa a decisão mais robusta.
+    PORTAS_CRITICAS = {4444, 31337}
+
     for porta in portas:
         if porta in PORTAS_RISCO:
             portas_perigosas.append((porta, PORTAS_RISCO[porta]))
@@ -249,11 +297,18 @@ def verificar_portas_abertas(portas_json: str) -> str:
     if not portas_perigosas:
         return f"PORTAS_SEGURAS: {sorted(portas_ok)} — nenhuma porta de risco detectada. "
 
+    criticas_encontradas = sorted(p for p, _ in portas_perigosas if p in PORTAS_CRITICAS)
+
     resultado = f"PORTAS_DE_RISCO ({len(portas_perigosas)} encontradas):\n"
     for porta, descricao in sorted(portas_perigosas):
         resultado += f"  Porta {porta}: {descricao}\n"
     if portas_ok:
         resultado += f"Portas sem risco: {sorted(portas_ok)} "
+    if criticas_encontradas:
+        resultado += (
+            f"\nCRÍTICO: porta(s) {criticas_encontradas} presente(s) — isto, "
+            "por si só, já classifica o veredicto como COMPROMETIDO. "
+        )
     return resultado.strip()
 
 
@@ -567,6 +622,21 @@ else:
 # =============================================================================
 # SEÇÃO 10: ANÁLISE AGÊNTICA DOS RESULTADOS (FASE 2 - LOOP DUPLO)
 # =============================================================================
+# CORREÇÃO IMPORTANTE (token/tempo): a versão anterior embutia o JSON bruto
+# dos 10 casos DUAS vezes — uma vez colado direto no texto do prompt
+# (tarefa_analise) e outra vez pedindo ao modelo que o "reenviasse" como
+# argumento da ferramenta analisar_bateria_testes. Isso dobra o tamanho do
+# prompt à toa e, pior, pede a um modelo local de 3B que reproduza um JSON
+# grande caractere por caractere como argumento de function-call — tarefa
+# em que modelos pequenos falham com frequência (truncam, trocam aspas etc.),
+# o que ajuda a explicar o timeout observado nesta fase.
+#
+# A correção separa as duas responsabilidades: analisar_bateria_testes() é
+# uma função determinística (não precisa de LLM para somar/filtrar listas),
+# então ela é chamada diretamente em Python. Só o RESUMO compacto que ela
+# devolve entra no prompt, e o modelo é usado apenas para o que realmente
+# exige linguagem natural: redigir o relatório. Isso reduz o prompt da Fase 2
+# de "10 casos completos em JSON" para poucas linhas de resumo.
 
 print(f"\n{'='*70} ")
 print("INICIANDO FASE 2: ANÁLISE AGÊNTICA DOS RESULTADOS ")
@@ -574,39 +644,40 @@ print(f"{'='*70} ")
 
 resultados_json = json.dumps(resultados, indent=2, ensure_ascii=False)
 
-tarefa_analise = f"""
-Você é um Analista Sênior de Segurança da Informação.
-Analise os dados brutos da bateria de testes de segurança abaixo e elabore um RELATÓRIO EXECUTIVO.
+# Chamada direta em Python: processamento determinístico, sem custo de LLM.
+resumo_bateria = analisar_bateria_testes(resultados_json)
 
-DADOS BRUTOS:
-{resultados_json}
+tarefa_analise = f"""Você é um Analista Sênior de Segurança da Informação.
 
-SUA TAREFA (Use a ferramenta 'analisar_bateria_testes' para processar os dados e depois gere o relatório):
-1. Identifique os padrões de falha do agente de investigação.
-2. Classifique a severidade dos erros (Falsos Negativos são críticos em segurança).
-3. Forneça 3 recomendações técnicas para melhorar o agente (ex: ajustar prompts, adicionar ferramentas, mudar thresholds).
-4. Gere um Resumo Executivo de no máximo 5 linhas para a diretoria de TI.
-"""
+O resumo abaixo já foi processado a partir da bateria de testes de segurança.
 
-FERRAMENTAS_ANALISE = [analisar_bateria_testes]
-agent_analista = Agent(llm, FERRAMENTAS_ANALISE, max_steps=4)
+{resumo_bateria}
+
+Com base apenas neste resumo, escreva um RELATÓRIO EXECUTIVO curto contendo:
+1. Padrões de falha do agente de investigação (se houver).
+2. Severidade dos erros (Falsos Negativos são críticos em segurança).
+3. Três recomendações técnicas objetivas para melhorar o agente.
+4. Um Resumo Executivo de no máximo 5 linhas para a diretoria de TI.
+
+Responda direto com o relatório em texto corrido. Não chame nenhuma ferramenta."""
 
 messages_analise = [
-    {"role": "system", "content": "Você é um Analista Sênior de Segurança. Use as ferramentas fornecidas para processar dados e gerar relatórios técnicos claros e acionáveis."},
+    {"role": "system", "content": "Você é um Analista Sênior de Segurança. Seja objetivo e direto."},
     {"role": "user", "content": tarefa_analise},
 ]
 
-print("⏳ Agente analisando resultados (isso pode levar alguns segundos com o modelo local)...")
+print("⏳ Agente elaborando o relatório executivo (prompt reduzido — só o resumo, não o JSON bruto)...")
+relatorio = None
 try:
-    messages_analise = agent_analista.run(messages_analise)
+    # Sem Agent/ferramentas aqui: essa etapa só precisa de texto, então uma
+    # chamada simples de llm.invoke() já resolve, mais rápida e mais barata
+    # em tokens do que rodar o laço completo do Agent.
+    relatorio = llm.invoke(messages_analise, max_tokens=500)
 except Exception as e:
     print(f"ERRO na fase de análise: {e}")
-    messages_analise = []
 
 print("\n--- 📝 RELATÓRIO EXECUTIVO (Gerado pelo Agente) ---")
-for m in messages_analise:
-    if m.get("role") == "assistant" and m.get("content"):
-        print(m["content"])
+print(relatorio or "(não foi possível gerar o relatório nesta execução) ")
 print("--- FIM DO RELATÓRIO ---\n")
 
 print("✅ Script executado do início ao fim. Ambos os loops agênticos concluídos.")
