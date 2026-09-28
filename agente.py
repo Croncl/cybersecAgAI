@@ -7,18 +7,26 @@ Inclui Loop Duplo: Investigação + Análise Agêntica dos Resultados
 Participantes: [Nome 1] e [Nome 2]
 Disciplina: Tópicos Especiais em Inteligência Computacional A — IA Agêntica 2026.2
 
-CORREÇÕES APLICADAS NESTA VERSÃO (v2), espelhando a versão API:
+CORREÇÕES E EXTENSÕES APLICADAS NESTA VERSÃO (v3):
   1. extrair_veredicto_da_conversa tenta parsear o JSON direto da resposta do
-     agente ANTES de gastar uma segunda geração com generate_structured — no
-     modelo local isso é ainda mais importante, porque uma segunda passada de
-     geração em CPU/ARM é cara em tempo, não só em tokens.
-  2. O argumento "timeout" foi removido do LLMAPI: esta versão do agentkit
-     não o aceita no construtor (TypeError). O timeout HTTP real é fixo em
-     60s dentro de agentkit/model.py (função post); se precisar de mais
-     tempo para gerações longas no Orange Pi, ajuste esse valor direto na
-     biblioteca.
-  3. Pequena pausa entre casos de teste, por segurança e para dar tempo ao
-     Ollama de liberar recursos entre gerações longas.
+     agente ANTES de gastar uma segunda geração com generate_structured.
+  2. Timeout HTTP do agentkit ajustado de 60s para 300s via monkeypatch de
+     agentkit.model.post (o construtor do LLMAPI não expõe esse parâmetro).
+  3. analisar_logs_rede tolera receber o JSON embrulhado em objeto (ex.:
+     {"logs": [...]}) e o prompt instrui o modelo a corrigir sem explicar o
+     erro em texto — evita respostas cortadas por estourar max_tokens.
+  4. verificar_portas_abertas sinaliza portas 4444/31337 como CRÍTICAS na
+     própria saída, reduzindo erro de veredicto de um modelo local fraco.
+  5. finalizar_se_vazio: se o modelo terminar o turno sem texto e sem chamar
+     ferramenta (falha observada em modelos locais pequenos), um pedido
+     explícito de fechamento é feito antes de desistir com ERRO_PARSE.
+  6. Fase 2 (relatório executivo) processa o resumo em Python puro e só pede
+     ao modelo o texto final — evita reenviar o JSON bruto duas vezes.
+  7. NOVO — RAG: a justificativa do veredicto é enriquecida com uma referência
+     técnica (MITRE ATT&CK/CWE) buscada por similaridade numa base vetorial
+     (Chroma + embeddings via Ollama), sempre em Python, nunca como uma 4ª
+     ferramenta exposta ao Agent (ver Seção 4b para a justificativa dessa
+     decisão de projeto).
 """
 
 # =============================================================================
@@ -27,7 +35,6 @@ CORREÇÕES APLICADAS NESTA VERSÃO (v2), espelhando a versão API:
 
 import hashlib
 import json
-import os
 import re
 import time
 import urllib.error
@@ -37,7 +44,7 @@ from typing import Literal
 import pandas as pd
 from pydantic import BaseModel, Field
 
-from agentkit import LLM, Agent, tool
+from agentkit import Agent, tool
 from agentkit.model import LLMAPI
 import agentkit.model as _agentkit_model
 
@@ -315,6 +322,101 @@ def verificar_portas_abertas(portas_json: str) -> str:
 print("Ferramentas de investigação registradas.")
 
 # =============================================================================
+# SEÇÃO 4b: BASE DE CONHECIMENTO (RAG) — EXTENSÃO NOVA
+# =============================================================================
+# Objetivo: enriquecer a JUSTIFICATIVA do veredicto com contexto técnico real
+# (MITRE ATT&CK / CWE), buscado por similaridade numa base vetorial (Chroma),
+# em vez de deixar o modelo inventar o texto explicativo do zero.
+#
+# DECISÃO DE PROJETO IMPORTANTE: esta consulta NÃO é exposta como uma 4ª
+# @tool para o Agent decidir sozinho quando chamar. Ela é feita de forma
+# determinística em Python, DEPOIS que o veredicto já foi decidido pelas três
+# ferramentas de investigação. Motivo: o modelo local de 3B já mostrou ser
+# instável na escolha/formatação de chamadas de ferramenta (ver histórico de
+# correções no topo do arquivo); adicionar uma 4ª ferramenta ao laço do Agent
+# arriscaria regredir os 10 casos de teste que já funcionam. Enriquecer a
+# justificativa em Python depois do veredicto é RAG de verdade (embedding +
+# busca vetorial), só que sem colocar mais uma decisão na mão do modelo fraco.
+#
+# Pré-requisito: rode "python3 construir_base_conhecimento.py" uma vez antes
+# (ver README.md). Se a base não existir, o agente funciona normalmente e só
+# perde o enriquecimento — nada quebra.
+
+CHROMA_PERSIST_DIR = "./chroma_cybersec"
+CHROMA_COLECAO = "mitre_attack_cybersec"
+MODELO_EMBEDDING = "nomic-embed-text"
+
+try:
+    import chromadb
+    _chroma_cliente = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    _chroma_colecao = _chroma_cliente.get_collection(CHROMA_COLECAO)
+    print(f"Base de conhecimento (RAG) carregada: {_chroma_colecao.count()} documentos.")
+except Exception as _erro_chroma:
+    _chroma_colecao = None
+    print(
+        f"⚠️  Base de conhecimento indisponível ({_erro_chroma}). "
+        "Rode 'python3 construir_base_conhecimento.py' para habilitar o RAG. "
+        "O agente segue funcionando normalmente sem ele."
+    )
+
+
+def _obter_embedding_ollama(texto: str) -> list[float] | None:
+    """Pede um embedding ao Ollama local. Devolve None se algo falhar
+    (base indisponível, Ollama fora do ar, modelo de embedding não baixado),
+    para que o enriquecimento seja sempre opcional e nunca derrube um caso.
+    """
+    try:
+        payload = json.dumps({"model": MODELO_EMBEDDING, "input": texto}).encode("utf-8")
+        request = urllib.request.Request(
+            "http://localhost:11434/v1/embeddings",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            dados = json.load(response)
+        return dados["data"][0]["embedding"]
+    except Exception:
+        return None
+
+
+def enriquecer_justificativa_com_rag(estado: dict, justificativa: str) -> str:
+    """Busca contexto técnico (MITRE ATT&CK/CWE) relacionado às evidências do
+    estado e acrescenta uma linha de referência à justificativa original.
+    Falha de forma silenciosa (devolve a justificativa sem alteração) se a
+    base não estiver disponível — o veredicto em si nunca depende disto.
+    """
+    if _chroma_colecao is None:
+        return justificativa
+
+    indicadores = (
+        estado.get("arquivos_comprometidos", [])
+        + estado.get("portas_perigosas", [])
+        + estado.get("alertas_rede", [])
+    )
+    if not indicadores:
+        return justificativa
+
+    consulta = " ".join(str(i) for i in indicadores[:3])  # os 3 indicadores mais relevantes
+    embedding_consulta = _obter_embedding_ollama(consulta)
+    if embedding_consulta is None:
+        return justificativa
+
+    try:
+        resultado = _chroma_colecao.query(query_embeddings=[embedding_consulta], n_results=1)
+        ids_encontrados = resultado.get("ids", [[]])[0]
+    except Exception:
+        return justificativa
+
+    if not ids_encontrados:
+        return justificativa
+
+    return f"{justificativa} [Ref. técnica: {ids_encontrados[0]}]"
+
+
+print("Extensão de base de conhecimento (RAG) configurada.")
+
+# =============================================================================
 # SEÇÃO 5: NOVA FERRAMENTA (FASE 2 - ANÁLISE AGÊNTICA)
 # =============================================================================
 
@@ -495,6 +597,53 @@ def extrair_veredicto_da_conversa(messages: list[dict], llm: LLMAPI) -> Veredict
         return None
 
 
+def finalizar_se_vazio(messages: list[dict], llm: LLMAPI) -> list[dict]:
+    """CORREÇÃO NOVA: modelos locais pequenos às vezes terminam o turno com uma
+    mensagem vazia — sem texto e sem chamada de ferramenta — mesmo depois de já
+    ter coletado evidências suficientes (visto nos casos 4, 6, 7 e 8: o laço
+    encerra, mas a última mensagem não tem nem content nem tool_calls, então
+    extrair_veredicto_da_conversa não tem o que ler e cai em ERRO_PARSE).
+
+    Isso não é um bug de parsing nosso — é o modelo "engasgando" no fechamento.
+    A correção detecta esse caso e faz UM pedido explícito e direto, reusando
+    o contexto já acumulado (as observações das ferramentas continuam visíveis
+    nas mensagens 'tool'), sem ferramentas ligadas desta vez — só texto.
+    """
+    if not messages:
+        return messages
+
+    ultima = messages[-1]
+    veio_vazia = (
+        ultima.get("role") == "assistant"
+        and not ultima.get("content")
+        and not ultima.get("tool_calls")
+    )
+    if not veio_vazia:
+        return messages
+
+    pedido_final = {
+        "role": "user",
+        "content": (
+            "Você não respondeu nada. Com base apenas nas evidências já "
+            "coletadas acima (não chame nenhuma ferramenta de novo), responda "
+            "AGORA com o veredicto, só o JSON, exatamente neste formato:\n"
+            '{"status": "SISTEMA SEGURO" | "ALERTA" | "COMPROMETIDO", '
+            '"confianca": <0-100>, "justificativa": "<uma frase curta>"}'
+        ),
+    }
+    tentativa = messages[:-1] + [pedido_final]  # descarta a mensagem vazia
+    print("  ⚠️  Resposta final veio vazia — pedindo ao modelo para fechar o veredicto...")
+    try:
+        resposta = llm.invoke(tentativa, max_tokens=200)
+    except Exception:
+        resposta = ""
+
+    if resposta:
+        tentativa.append({"role": "assistant", "content": resposta})
+        return tentativa
+    return messages
+
+
 def investigar(tarefa: str, verbose: bool = False) -> tuple[Veredicto | None, dict]:
     """Executa a investigação completa: decisão dinâmica de ferramentas (Agent),
     atualização do estado a cada observação, e extração do veredicto final.
@@ -510,6 +659,7 @@ def investigar(tarefa: str, verbose: bool = False) -> tuple[Veredicto | None, di
     # parar de chamar ferramentas e responder com o veredicto.
     agent = Agent(llm, FERRAMENTAS_INVESTIGACAO, max_steps=12)
     messages = agent.run(messages)
+    messages = finalizar_se_vazio(messages, llm)  # CORREÇÃO: força o fechamento se veio vazio
 
     for i, m in enumerate(messages):
         if m.get("role") == "tool":
@@ -536,6 +686,13 @@ def investigar(tarefa: str, verbose: bool = False) -> tuple[Veredicto | None, di
         print("--- FIM DO TRAÇO ---\n")
 
     veredicto = extrair_veredicto_da_conversa(messages, llm)
+
+    # RAG: enriquece a justificativa com uma referência técnica (MITRE ATT&CK),
+    # só quando há indício de problema — não roda para SISTEMA SEGURO, onde
+    # não há indicador nenhum para buscar contexto sobre.
+    if veredicto is not None and veredicto.status != "SISTEMA SEGURO":
+        veredicto.justificativa = enriquecer_justificativa_com_rag(estado, veredicto.justificativa)
+
     return veredicto, estado
 
 print("Laço do agente de investigação configurado.")

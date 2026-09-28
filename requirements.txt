@@ -1,4 +1,17 @@
+# Dependência principal da disciplina (biblioteca de referência agentkit)
 git+https://github.com/silvaan/agentic-ai@0142297d3acedd545dbf1e6f5a991d2f764bcec1
+
+# --- Versão API (agente_API.py) ---
+python-dotenv==1.2.3
+
+# --- Extensão RAG (ambas as versões) ---
+# chromadb costuma ter wheels pré-compiladas para linux/aarch64, mas confira
+# antes de instalar em ARM (Orange Pi); se não houver wheel, a instalação
+# pode tentar compilar do zero e demorar/falhar.
+chromadb>=0.5,<1.0
+
+# --- Demais dependências (resolvidas automaticamente pelo agentkit/chromadb,
+#     listadas aqui para reprodutibilidade do ambiente testado) ---
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -6,9 +19,6 @@ attrs==26.1.0
 certifi==2026.7.22
 click==8.5.0
 cloudpickle==3.1.2
-cuda-bindings==13.4.2
-cuda-pathfinder==1.8.2
-cuda-toolkit==13.0.3.0
 diskcache==5.6.3
 filelock==4.0.1
 fsspec==2026.9.0
@@ -28,21 +38,6 @@ mdurl==0.1.2
 mpmath==1.3.0
 networkx==3.6.1
 numpy==2.4.6
-nvidia-cublas==13.1.1.3
-nvidia-cuda-cupti==13.0.85
-nvidia-cuda-nvrtc==13.0.88
-nvidia-cuda-runtime==13.0.96
-nvidia-cudnn-cu13==9.24.0.43
-nvidia-cufft==12.0.0.61
-nvidia-cufile==1.15.1.6
-nvidia-curand==10.4.0.35
-nvidia-cusolver==12.0.4.66
-nvidia-cusparse==12.6.3.3
-nvidia-cusparselt-cu13==0.8.1
-nvidia-nccl-cu13==2.30.7
-nvidia-nvjitlink==13.4.92
-nvidia-nvshmem-cu13==3.4.5
-nvidia-nvtx==13.0.85
 outlines==1.3.3
 outlines_core==0.2.14
 packaging==26.3
@@ -52,7 +47,6 @@ pydantic==2.13.5
 pydantic_core==2.46.5
 Pygments==2.21.0
 python-dateutil==2.9.0.post0
-python-dotenv==1.2.3
 PyYAML==6.0.3
 referencing==0.37.0
 regex==2026.9.10
@@ -70,3 +64,7 @@ triton==3.8.0
 typer==0.27.2
 typing-inspection==0.4.4
 typing_extensions==4.16.0
+
+# Pacotes acima com dependência de GPU NVIDIA (nvidia-cuda-*, nvidia-cudnn-*,
+# etc.) foram OMITIDOS deste arquivo: são inúteis e não instaláveis em ARM
+# (Orange Pi); só se aplicam a uma máquina x86_64 com GPU NVIDIA.

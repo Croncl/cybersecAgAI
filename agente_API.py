@@ -6,7 +6,7 @@ Versão API (Groq) - Conectado à Internet
 Participantes: [Nome 1] e [Nome 2]
 Disciplina: Tópicos Especiais em Inteligência Computacional A — IA Agêntica 2026.2
 
-CORREÇÕES APLICADAS NESTA VERSÃO (v2):
+CORREÇÕES E EXTENSÕES APLICADAS NESTA VERSÃO (v3):
   1. extrair_veredicto_da_conversa agora tenta parsear o JSON direto da resposta
      do agente ANTES de gastar uma chamada extra com generate_structured.
      Isso corta o consumo de tokens quase pela metade.
@@ -15,6 +15,12 @@ CORREÇÕES APLICADAS NESTA VERSÃO (v2):
   3. max_tokens reduzido de 800 para 450 (resposta é um JSON curto).
   4. Pausa de alguns segundos entre casos de teste, para não estourar o
      limite de tokens por minuto (TPM) do tier gratuito.
+  5. verificar_portas_abertas sinaliza portas 4444/31337 como CRÍTICAS na
+     própria saída (portado da versão local, reduz ambiguidade do veredicto).
+  6. NOVO — RAG: a justificativa do veredicto é enriquecida com uma referência
+     técnica (MITRE ATT&CK/CWE) buscada por similaridade numa base vetorial
+     (Chroma + embeddings via Ollama local), em Python, fora do laço do Agent
+     — não é uma 4ª ferramenta exposta ao modelo (ver Seção 4b).
 """
 
 # =============================================================================
@@ -26,13 +32,14 @@ import json
 import os
 import re
 import time
+import urllib.request
 from typing import Literal
 
 import pandas as pd
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from agentkit import LLM, Agent, tool
+from agentkit import Agent, tool
 from agentkit.model import LLMAPI
 
 # Carregar variáveis de ambiente do .env
@@ -258,6 +265,12 @@ def verificar_portas_abertas(portas_json: str) -> str:
     portas_perigosas = []
     portas_ok = []
 
+    # CORREÇÃO (portada da versão local): portas 4444 e 31337 decidem o
+    # veredicto sozinhas segundo os critérios do prompt de sistema; sinalizar
+    # isso diretamente na saída da ferramenta reduz a chance de qualquer
+    # modelo (mesmo o mais forte via API) classificar como ALERTA por engano.
+    PORTAS_CRITICAS = {4444, 31337}
+
     for porta in portas:
         if porta in PORTAS_RISCO:
             portas_perigosas.append((porta, PORTAS_RISCO[porta]))
@@ -270,17 +283,113 @@ def verificar_portas_abertas(portas_json: str) -> str:
             f"nenhuma porta de risco detectada. "
         )
 
+    criticas_encontradas = sorted(p for p, _ in portas_perigosas if p in PORTAS_CRITICAS)
+
     resultado = f"PORTAS_DE_RISCO ({len(portas_perigosas)} encontradas):\n"
     for porta, descricao in sorted(portas_perigosas):
         resultado += f"  Porta {porta}: {descricao}\n"
     if portas_ok:
         resultado += f"Portas sem risco: {sorted(portas_ok)} "
+    if criticas_encontradas:
+        resultado += (
+            f"\nCRÍTICO: porta(s) {criticas_encontradas} presente(s) — isto, "
+            "por si só, já classifica o veredicto como COMPROMETIDO. "
+        )
     return resultado.strip()
 
 
 print("Ferramentas registradas:")
 for t in [verificar_integridade_arquivo, analisar_logs_rede, verificar_portas_abertas]:
     print(f"  @tool: {t.tool_schema['name']} — {t.tool_schema['description'][:60]}... ")
+
+# =============================================================================
+# SEÇÃO 4b: BASE DE CONHECIMENTO (RAG) — EXTENSÃO NOVA
+# =============================================================================
+# Mesma extensão da versão local (ver agente.py, Seção 4b, para a justificativa
+# completa da decisão de projeto). Resumo: os embeddings são gerados sempre
+# via Ollama local (rápido, grátis, já rodando na máquina), independentemente
+# de a etapa de RACIOCÍNIO usar o modelo local ou a API da Groq. A consulta à
+# base NÃO é uma 4ª @tool exposta ao Agent — é feita em Python, depois que o
+# veredicto já foi decidido pelas três ferramentas de investigação, então não
+# tem como interferir na decisão do modelo nem regredir os casos de teste.
+#
+# Pré-requisito: rode "python3 construir_base_conhecimento.py" uma vez antes
+# (precisa do Ollama rodando local com "ollama pull nomic-embed-text"). Se a
+# base não existir, o agente funciona normalmente e só perde o enriquecimento.
+
+CHROMA_PERSIST_DIR = "./chroma_cybersec"
+CHROMA_COLECAO = "mitre_attack_cybersec"
+MODELO_EMBEDDING = "nomic-embed-text"
+
+try:
+    import chromadb
+    _chroma_cliente = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    _chroma_colecao = _chroma_cliente.get_collection(CHROMA_COLECAO)
+    print(f"Base de conhecimento (RAG) carregada: {_chroma_colecao.count()} documentos.")
+except Exception as _erro_chroma:
+    _chroma_colecao = None
+    print(
+        f"⚠️  Base de conhecimento indisponível ({_erro_chroma}). "
+        "Rode 'python3 construir_base_conhecimento.py' para habilitar o RAG. "
+        "O agente segue funcionando normalmente sem ele."
+    )
+
+
+def _obter_embedding_ollama(texto: str) -> list[float] | None:
+    """Pede um embedding ao Ollama local. Devolve None se algo falhar, para
+    que o enriquecimento seja sempre opcional e nunca derrube um caso —
+    inclusive quando esta versão roda num ambiente sem Ollama instalado.
+    """
+    try:
+        payload = json.dumps({"model": MODELO_EMBEDDING, "input": texto}).encode("utf-8")
+        request = urllib.request.Request(
+            "http://localhost:11434/v1/embeddings",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            dados = json.load(response)
+        return dados["data"][0]["embedding"]
+    except Exception:
+        return None
+
+
+def enriquecer_justificativa_com_rag(estado: dict, justificativa: str) -> str:
+    """Busca contexto técnico (MITRE ATT&CK/CWE) relacionado às evidências do
+    estado e acrescenta uma referência à justificativa original. Falha de
+    forma silenciosa (devolve a justificativa sem alteração) se a base ou o
+    Ollama não estiverem disponíveis.
+    """
+    if _chroma_colecao is None:
+        return justificativa
+
+    indicadores = (
+        estado.get("arquivos_comprometidos", [])
+        + estado.get("portas_perigosas", [])
+        + estado.get("alertas_rede", [])
+    )
+    if not indicadores:
+        return justificativa
+
+    consulta = " ".join(str(i) for i in indicadores[:3])
+    embedding_consulta = _obter_embedding_ollama(consulta)
+    if embedding_consulta is None:
+        return justificativa
+
+    try:
+        resultado = _chroma_colecao.query(query_embeddings=[embedding_consulta], n_results=1)
+        ids_encontrados = resultado.get("ids", [[]])[0]
+    except Exception:
+        return justificativa
+
+    if not ids_encontrados:
+        return justificativa
+
+    return f"{justificativa} [Ref. técnica: {ids_encontrados[0]}]"
+
+
+print("Extensão de base de conhecimento (RAG) configurada.")
 
 # =============================================================================
 # SEÇÃO 5: ESTADO, PROMPT E SAÍDA ESTRUTURADA
@@ -479,11 +588,54 @@ def extrair_veredicto_da_conversa(messages: list[dict], llm: LLMAPI) -> Veredict
         return None
 
 
+def finalizar_se_vazio(messages: list[dict], llm: LLMAPI) -> list[dict]:
+    """Rede de segurança portada da versão local: se a última mensagem do
+    agente vier vazia (sem texto e sem tool_calls), pede explicitamente ao
+    modelo que finalize com o veredicto, reusando o contexto já acumulado.
+    Na Groq isso é raro (modelo mais forte), mas custa nada manter a mesma
+    proteção das duas versões.
+    """
+    if not messages:
+        return messages
+
+    ultima = messages[-1]
+    veio_vazia = (
+        ultima.get("role") == "assistant"
+        and not ultima.get("content")
+        and not ultima.get("tool_calls")
+    )
+    if not veio_vazia:
+        return messages
+
+    pedido_final = {
+        "role": "user",
+        "content": (
+            "Você não respondeu nada. Com base apenas nas evidências já "
+            "coletadas acima (não chame nenhuma ferramenta de novo), responda "
+            "AGORA com o veredicto, só o JSON, exatamente neste formato:\n"
+            '{"status": "SISTEMA SEGURO" | "ALERTA" | "COMPROMETIDO", '
+            '"confianca": <0-100>, "justificativa": "<uma frase curta>"}'
+        ),
+    }
+    tentativa = messages[:-1] + [pedido_final]
+    print("  ⚠️  Resposta final veio vazia — pedindo ao modelo para fechar o veredicto...")
+    try:
+        resposta = com_retry(llm.invoke, tentativa, max_tokens=200)
+    except Exception:
+        resposta = ""
+
+    if resposta:
+        tentativa.append({"role": "assistant", "content": resposta})
+        return tentativa
+    return messages
+
+
 def investigar(tarefa: str, verbose: bool = False) -> tuple[Veredicto | None, dict]:
     """Executa a investigação completa e retorna o veredicto e o estado final.
 
-    As duas chamadas à API do laço (agent.run e extrair_veredicto_da_conversa)
-    passam por com_retry, para absorver 429 sem derrubar o caso de teste.
+    As chamadas à API do laço (agent.run, o fechamento de emergência e
+    extrair_veredicto_da_conversa) passam por com_retry, para absorver 429
+    sem derrubar o caso de teste.
     """
     estado = novo_estado()
 
@@ -494,6 +646,7 @@ def investigar(tarefa: str, verbose: bool = False) -> tuple[Veredicto | None, di
 
     agent = Agent(llm, FERRAMENTAS, max_steps=12)
     messages = com_retry(agent.run, messages)
+    messages = finalizar_se_vazio(messages, llm)
 
     for i, m in enumerate(messages):
         if m.get("role") == "tool":
@@ -520,6 +673,12 @@ def investigar(tarefa: str, verbose: bool = False) -> tuple[Veredicto | None, di
         print("--- FIM DO TRAÇO ---\n")
 
     veredicto = extrair_veredicto_da_conversa(messages, llm)
+
+    # RAG: enriquece a justificativa com uma referência técnica (MITRE ATT&CK),
+    # só quando há indício de problema.
+    if veredicto is not None and veredicto.status != "SISTEMA SEGURO":
+        veredicto.justificativa = enriquecer_justificativa_com_rag(estado, veredicto.justificativa)
+
     return veredicto, estado
 
 
