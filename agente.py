@@ -4,7 +4,6 @@ Agente de Cibersegurança para Análise de Comprometimento de Sistema
 Versão Local (Ollama) - Modelo 3B para aproveitar os 12GB de RAM do Orange Pi
 Inclui Loop Duplo: Investigação + Análise Agêntica dos Resultados
 
-Participantes: [Nome 1] e [Nome 2]
 Disciplina: Tópicos Especiais em Inteligência Computacional A — IA Agêntica 2026.2
 
 CORREÇÕES E EXTENSÕES APLICADAS NESTA VERSÃO (v3):
