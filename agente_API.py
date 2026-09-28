@@ -3,7 +3,6 @@
 Agente de Cibersegurança para Análise de Comprometimento de Sistema
 Versão API (Groq) - Conectado à Internet
 
-Participantes: [Nome 1] e [Nome 2]
 Disciplina: Tópicos Especiais em Inteligência Computacional A — IA Agêntica 2026.2
 
 CORREÇÕES E EXTENSÕES APLICADAS NESTA VERSÃO (v3):
